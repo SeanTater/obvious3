@@ -3,12 +3,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
-use futures::{StreamExt, TryStreamExt};
-use object_store::path::Path as ObjectStorePath;
-use object_store::{DynObjectStore, ObjectMeta, ObjectStore};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufWriter};
+use clap::Parser;
+use futures::TryStreamExt;
+use object_store::{ObjectMeta, ObjectStore};
+use tokio::io::AsyncBufReadExt;
 use url::Url;
 
 use crate::{Args, ObjectExport, Preamble};
@@ -69,14 +67,14 @@ impl StdoutWriter {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ObjectExport>(100);
         let mut buffer = std::io::BufWriter::new(std::io::stdout());
         buffer.write_all(serde_json::to_string(&preamble).unwrap().as_bytes())?;
-        buffer.write(b"\n")?;
+        buffer.write_all(b"\n")?;
         tokio::spawn(async move {
             while let Some(obj) = rx.recv().await {
                 let mut line = serde_json::to_string(&obj).unwrap();
                 // This is blocking IO and it could cause a momentary pause in the stream
                 // For our use case that is probably okay
                 line.push('\n');
-                if let Err(_) = buffer.write_all(line.as_bytes()) {
+                if buffer.write_all(line.as_bytes()).is_err() {
                     // Writing to stdout failed, so we should stop, but we don't need to error
                     // because probably it's just a broken pipe
                     break;
@@ -128,40 +126,39 @@ impl Find {
         let stdin = tokio::io::stdin();
         let reader = tokio::io::BufReader::new(stdin).lines();
         let stream = tokio_stream::wrappers::LinesStream::new(reader);
-        let stream = stream
+        stream
             .map_err(anyhow::Error::from)
             .and_then(
                 |line| async move { anyhow::Ok(serde_json::from_str::<ObjectExport>(&line)?) },
             )
-            .map_ok(ObjectMeta::from);
-        stream
+            .map_ok(ObjectMeta::from)
     }
 
     pub async fn run(&self, global_args: &Args) -> Result<()> {
         // These ref's mean that `async move` later doesn't take ownership of the fields
-        let ref path_regex = self
+        let path_regex = &self
             .path_match
             .as_ref()
             .map(|s| regex::Regex::new(s))
             .transpose()?;
-        let ref base_regex = self
+        let base_regex = &self
             .basename_match
             .as_ref()
             .map(|s| regex::Regex::new(s))
             .transpose()?;
 
         let preamble = self.preamble()?;
-        let ref writer = StdoutWriter::start(&preamble)?;
+        let writer = &StdoutWriter::start(&preamble)?;
 
         let print_matches = |meta: ObjectMeta| async {
             let mut valid = true;
             // Try to match the path
             if let Some(reg) = &path_regex {
-                valid &= reg.is_match(&meta.location.to_string());
+                valid &= reg.is_match(meta.location.as_ref());
             }
             // Try to match the basename
             if let Some(reg) = &base_regex {
-                valid &= reg.is_match(&meta.location.filename().unwrap_or_default());
+                valid &= reg.is_match(meta.location.filename().unwrap_or_default());
             }
 
             // Try to match the size
@@ -187,7 +184,7 @@ impl Find {
             if let Some(before) = self.before {
                 valid &= meta.last_modified <= Utc::now() - chrono::Duration::seconds(before);
             }
-            if valid == !self.invert {
+            if valid != self.invert {
                 writer.write(meta.into()).await?;
             }
             Ok(())
