@@ -26,7 +26,7 @@ struct Args {
 enum IOAction {
     /// List objects recursively, and filter them by various criteria. Can be chained.
     ///
-    /// Example: `obvious3 find -r /path -b '.*\.parquet' | obvious3 find --not --over 1000000 bytes`
+    /// Example: `obvious3 find -r /path -b '.*\.parquet' | obvious3 find --not --after 3`
     Find(find::Find),
 }
 
@@ -85,4 +85,16 @@ impl From<ObjectExport> for ObjectMeta {
             version: export.version,
         }
     }
+}
+
+/// A header line for each object listing,
+/// which includes the object store they refer to, along with some metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "file_type")]
+pub enum Preamble {
+    /// Protocol version 0
+    Obvious3_0 {
+        /// The object store that the objects are from
+        root: Url,
+    },
 }

@@ -1,16 +1,17 @@
+use std::io::Write;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectStorePath;
 use object_store::{DynObjectStore, ObjectMeta, ObjectStore};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, BufWriter};
 use url::Url;
 
-use crate::{Args, ObjectExport};
+use crate::{Args, ObjectExport, Preamble};
 
 #[derive(Debug, Parser)]
 pub struct Find {
@@ -50,6 +51,47 @@ pub struct Find {
     before: Option<i64>,
 }
 
+/// A queue that writes lines to stdout.
+///
+/// In case the motivation is not clear, there are a few reasons for this:
+/// * We don't want to panic when the pipe is closed
+/// * We want to make sure only whole lines are written
+/// * We want to include a BufRead for performance
+///
+/// * But synchronous blocking on the main thread is not a super big deal as long as
+///   it isn't on every single line
+struct StdoutWriter {
+    tx: tokio::sync::mpsc::Sender<ObjectExport>,
+}
+
+impl StdoutWriter {
+    fn start(preamble: &Preamble) -> Result<Self> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ObjectExport>(100);
+        let mut buffer = std::io::BufWriter::new(std::io::stdout());
+        buffer.write_all(serde_json::to_string(&preamble).unwrap().as_bytes())?;
+        buffer.write(b"\n")?;
+        tokio::spawn(async move {
+            while let Some(obj) = rx.recv().await {
+                let mut line = serde_json::to_string(&obj).unwrap();
+                // This is blocking IO and it could cause a momentary pause in the stream
+                // For our use case that is probably okay
+                line.push('\n');
+                if let Err(_) = buffer.write_all(line.as_bytes()) {
+                    // Writing to stdout failed, so we should stop, but we don't need to error
+                    // because probably it's just a broken pipe
+                    break;
+                }
+            }
+        });
+        Ok(Self { tx })
+    }
+
+    /// Write a line to stdout
+    async fn write(&self, meta: ObjectExport) -> Result<()> {
+        Ok(self.tx.send(meta).await?)
+    }
+}
+
 impl Find {
     fn base_url(&self) -> Result<Option<Url>> {
         let root = match &self.root {
@@ -65,6 +107,20 @@ impl Find {
         Ok(Some(
             Url::from_file_path(path).map_err(|_| anyhow::anyhow!("Invalid path"))?,
         ))
+    }
+
+    fn preamble(&self) -> Result<Preamble> {
+        match self.base_url()? {
+            Some(url) => Ok(Preamble::Obvious3_0 { root: url }),
+            None => {
+                // Try to read the preamble from stdin
+                let mut buf = String::new();
+                std::io::stdin().read_line(&mut buf)?;
+                let preamble: Preamble = serde_json::from_str(&buf)
+                    .context("Reading first JSON line as a Preamble. (Remember to include one)")?;
+                Ok(preamble)
+            }
+        }
     }
 
     /// Produce an asynchronous stream of ObjectMeta objects read as NDJSON from stdin
@@ -94,7 +150,10 @@ impl Find {
             .map(|s| regex::Regex::new(s))
             .transpose()?;
 
-        let print_matches = |meta: ObjectMeta| {
+        let preamble = self.preamble()?;
+        let ref writer = StdoutWriter::start(&preamble)?;
+
+        let print_matches = |meta: ObjectMeta| async {
             let mut valid = true;
             // Try to match the path
             if let Some(reg) = &path_regex {
@@ -129,26 +188,21 @@ impl Find {
                 valid &= meta.last_modified <= Utc::now() - chrono::Duration::seconds(before);
             }
             if valid == !self.invert {
-                println!("{}", serde_json::to_string(&ObjectExport::from(meta))?);
+                writer.write(meta.into()).await?;
             }
             Ok(())
         };
-
         match self.base_url()? {
             Some(url) => {
                 let (store, path) = object_store::parse_url(&url)?;
                 let store = Arc::new(store);
                 let gen = store.list(Some(&path)).map_err(anyhow::Error::from);
-                gen.try_for_each_concurrent(global_args.concurrency, |meta| async move {
-                    print_matches(meta)
-                })
-                .await?;
+                gen.try_for_each_concurrent(global_args.concurrency, print_matches)
+                    .await?;
             }
             None => {
                 Self::read_stdin()
-                    .try_for_each_concurrent(global_args.concurrency, |meta| async move {
-                        print_matches(meta)
-                    })
+                    .try_for_each_concurrent(global_args.concurrency, print_matches)
                     .await?;
             }
         };
